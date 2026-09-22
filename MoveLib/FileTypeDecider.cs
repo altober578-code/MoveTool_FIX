@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Diagnostics;
 using System.IO;
+using Newtonsoft.Json;
 
 namespace MoveLib
 {
@@ -47,6 +48,52 @@ namespace MoveLib
                 return FileType.Unknown;
             }
 
+        }
+
+        /// <summary>
+        /// Works out which format a json holds by looking at its top level property
+        /// names, so a caller can run the one converter that stands a chance instead
+        /// of trying each in turn and reporting the failures of the wrong ones.
+        /// Only the root properties are read, so a large file costs nothing.
+        /// </summary>
+        public static FileType DecideJson(string fileName)
+        {
+            try
+            {
+                using (var sr = new StreamReader(fileName))
+                using (var reader = new JsonTextReader(sr))
+                {
+                    while (reader.Read())
+                    {
+                        if (reader.TokenType != JsonToken.PropertyName || reader.Depth != 1)
+                        {
+                            continue;
+                        }
+
+                        switch ((string) reader.Value)
+                        {
+                            case "MoveLists":
+                            case "HitboxEffectses":
+                            case "BACVER":
+                                return FileType.BAC;
+
+                            case "Charges":
+                            case "Inputs":
+                            case "CancelLists":
+                                return FileType.BCM;
+
+                            case "BCH":
+                                return FileType.BCH;
+                        }
+                    }
+                }
+            }
+            catch (Exception)
+            {
+                return FileType.Unknown;
+            }
+
+            return FileType.Unknown;
         }
     }
 

@@ -64,6 +64,95 @@ namespace MoveLib.BAC
             return true;
         }
 
+        private const short HighestKnownType = 12;
+
+        /// <summary>
+        /// Returns how many type blocks a move really has, which is not always what its
+        /// header claims. A file written from JSON whose numberOfTypes was left stale
+        /// declares more blocks than were written, and the surplus entries land on the
+        /// tick arrays that follow the list -- so trusting the header makes the reader
+        /// decode tick data as type headers and run off into nowhere.
+        /// The list is always immediately followed by the tick array of one of its own
+        /// entries, so the lowest tick address marks where the list has to end.
+        /// </summary>
+        private static int CountTypeEntries(BinaryReader inFile, long listStart, int declared, int entrySize)
+        {
+            long resumeAt = inFile.BaseStream.Position;
+            long listEnd = long.MaxValue;
+            int real = 0;
+
+            try
+            {
+                for (int k = 0; k < declared; k++)
+                {
+                    long entry = listStart + (entrySize*k);
+
+                    if (entry < 0 || entry + entrySize > inFile.BaseStream.Length || entry >= listEnd)
+                    {
+                        break;
+                    }
+
+                    inFile.BaseStream.Seek(entry, SeekOrigin.Begin);
+                    short type = inFile.ReadInt16();
+                    short count = inFile.ReadInt16();
+                    int tickOffset = inFile.ReadInt32();
+
+                    if (type < 0 || type > HighestKnownType || count < 0)
+                    {
+                        break;
+                    }
+
+                    if (count > 0)
+                    {
+                        listEnd = Math.Min(listEnd, entry + tickOffset);
+                    }
+
+                    real++;
+                }
+            }
+            finally
+            {
+                inFile.BaseStream.Seek(resumeAt, SeekOrigin.Begin);
+            }
+
+            return real;
+        }
+
+        /// <summary>
+        /// Counts the type blocks that will actually be written for a move. The writer
+        /// emits one block per non-empty array, so taking numberOfTypes from the JSON
+        /// instead would let a stale value through and produce a file this tool can no
+        /// longer read.
+        /// </summary>
+        private static int CountTypeBlocks(Move move)
+        {
+            int blocks = 0;
+
+            if (move.AutoCancels != null && move.AutoCancels.Length > 0) blocks++;
+            if (move.Type1s != null && move.Type1s.Length > 0) blocks++;
+            if (move.Forces != null && move.Forces.Length > 0) blocks++;
+            if (move.Cancels != null && move.Cancels.Length > 0) blocks++;
+            if (move.Others != null && move.Others.Length > 0) blocks++;
+            if (move.Hitboxes != null && move.Hitboxes.Length > 0) blocks++;
+            if (move.Hurtboxes != null && move.Hurtboxes.Length > 0) blocks++;
+            if (move.PhysicsBoxes != null && move.PhysicsBoxes.Length > 0) blocks++;
+            if (move.Animations != null && move.Animations.Length > 0) blocks++;
+            if (move.Type9s != null && move.Type9s.Length > 0) blocks++;
+            if (move.SoundEffects != null && move.SoundEffects.Length > 0) blocks++;
+            if (move.VisualEffects != null && move.VisualEffects.Length > 0) blocks++;
+            if (move.Positions != null && move.Positions.Length > 0) blocks++;
+
+            return blocks;
+        }
+
+        /// <summary>
+        /// Consulted once per write when a json declares more type blocks than it actually
+        /// holds. Receives one line per affected move and returns true to write the real
+        /// counts, false to write the declared ones unchanged. When left unset the declared
+        /// counts are kept, so no caller gets a header rewritten without asking for it.
+        /// </summary>
+        public static Func<IList<string>, bool> StaleTypeCountDecision { get; set; }
+
         public static BACFile FromUassetFile(string fileName)
         {
             List<Move> MoveList = new List<Move>();
@@ -272,7 +361,24 @@ namespace MoveLib.BAC
 
                         long typeListBaseOffset = inFile.BaseStream.Position;
 
-                        for (int k = 0; k < thisMove.numberOfTypes; k++)
+                        int realNumberOfTypes = CountTypeEntries(inFile, typeListBaseOffset,
+                            thisMove.numberOfTypes, BACVER == 1 ? 16 : 12);
+
+                        if (realNumberOfTypes != thisMove.numberOfTypes)
+                        {
+                            // The declared count is left in the json so the header still says
+                            // what the file said, and correcting it stays the caller's choice.
+                            // Only the parse is clamped: the surplus entries sit on top of the
+                            // tick arrays that follow the list, so reading them decodes tick
+                            // data as type headers.
+                            Console.WriteLine(
+                                "Warning: move \"" + thisMove.Name + "\" (index " + j + ") claims " +
+                                thisMove.numberOfTypes + " type blocks but only " + realNumberOfTypes +
+                                " are present. Reading the " + realNumberOfTypes +
+                                " that are there and leaving the header as it is.");
+                        }
+
+                        for (int k = 0; k < realNumberOfTypes; k++)
                         {
                             int typeSize = 12;
                             switch (BACVER)
@@ -1250,6 +1356,39 @@ namespace MoveLib.BAC
         {
             byte[] outPutFileBytes;
 
+            // Gather every move whose declared count disagrees with what it holds before
+            // writing anything, so the question is asked once for the file rather than
+            // once per move.
+            var staleTypeCounts = new List<string>();
+
+            foreach (var moveList in file.MoveLists)
+            {
+                if (moveList == null || moveList.Moves == null)
+                {
+                    continue;
+                }
+
+                foreach (var move in moveList.Moves)
+                {
+                    if (move == null)
+                    {
+                        continue;
+                    }
+
+                    int blocks = CountTypeBlocks(move);
+
+                    if (blocks != move.numberOfTypes)
+                    {
+                        staleTypeCounts.Add("\"" + move.Name + "\" declares " + move.numberOfTypes +
+                                            " type blocks but holds " + blocks);
+                    }
+                }
+            }
+
+            bool writeRealTypeCounts = staleTypeCounts.Count > 0
+                                       && StaleTypeCountDecision != null
+                                       && StaleTypeCountDecision(staleTypeCounts);
+
             using (var ms = new MemoryStream())
             using (var outFile = new BinaryWriter(ms))
             {
@@ -1364,7 +1503,11 @@ namespace MoveLib.BAC
                         outFile.Write(move.Flag);
                         outFile.Write(move.unk9);
 
-                        outFile.Write(move.numberOfTypes);
+                        // The type list itself always gets one entry per non-empty array.
+                        // Only the declared count follows the caller's decision.
+                        int typeBlocksToWrite = CountTypeBlocks(move);
+
+                        outFile.Write(writeRealTypeCounts ? typeBlocksToWrite : move.numberOfTypes);
 
                         outFile.Write(move.unk13);
                         outFile.Write(move.HeaderSize);

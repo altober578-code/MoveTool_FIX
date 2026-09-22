@@ -410,9 +410,25 @@ namespace MoveLib.BCM
                     if (StartOfCancelInts != 0)
                     {
                         Debug.WriteLine("We got something!!!" + inFile.BaseStream.Position.ToString("X") + " - Should be: " + (thisAddress + StartOfCancelInts).ToString("X"));
-                        Debug.WriteLine(((thisAddress + StartOfCancelBytes) - (thisAddress + StartOfCancelInts)) / MovesInList);
 
-                        for (int j = 0; j < MovesInList; j++)
+                        // ToUassetFile only emits a pair for cancels that have one, so a list
+                        // can carry fewer pairs than it has moves -- add a cancel without
+                        // CancelInts and MovesInList stops being the count. The size of the
+                        // region is the only figure that always holds.
+                        int pairsPresent = Math.Max(0, (StartOfCancelBytes - StartOfCancelInts)/8);
+
+                        if (pairsPresent != MovesInList)
+                        {
+                            Console.WriteLine("Warning: CancelLists[" + i + "] lists " + MovesInList +
+                                              " moves but carries " + pairsPresent +
+                                              " CancelInts pairs. Reading the pairs that are present.");
+                        }
+
+                        inFile.BaseStream.Seek(thisAddress + StartOfCancelInts, SeekOrigin.Begin);
+
+                        // The pairs are stored back to back with nothing saying which cancel
+                        // each belongs to, so they can only be handed out in order.
+                        for (int j = 0; j < pairsPresent && j < thisCancelList.Cancels.Length; j++)
                         {
                             int value1 = inFile.ReadInt32();
                             int value2 = inFile.ReadInt32();
@@ -427,16 +443,15 @@ namespace MoveLib.BCM
 
                     Debug.WriteLine("Position is " + inFile.BaseStream.Position.ToString("X") + " - Should be: " + (thisAddress + StartOfCancelBytes).ToString("X"));
 
-                    if (inFile.BaseStream.Position != thisAddress + StartOfCancelBytes) //NOT a good idea
+                    if (inFile.BaseStream.Position != thisAddress + StartOfCancelBytes)
                     {
-                        Debug.WriteLine("We are not where we're supposed to be, reading bytes until we are...");
+                        // This used to crawl forward one ReadByte at a time, but the read sat
+                        // inside a Debug.WriteLine argument -- and Debug.WriteLine is
+                        // [Conditional("DEBUG")], so a release build dropped the read and spun
+                        // forever on a position that could never reach the target.
+                        Debug.WriteLine("We are not where we're supposed to be, seeking to StartOfCancelBytes.");
 
-                        while (inFile.BaseStream.Position != thisAddress + StartOfCancelBytes)
-                        {
-                            Debug.WriteLine(inFile.ReadByte());
-                        }
-
-                        Debug.WriteLine("Position is " + inFile.BaseStream.Position.ToString("X") + " - Should be: " + (thisAddress + StartOfCancelBytes).ToString("X"));
+                        inFile.BaseStream.Seek(thisAddress + StartOfCancelBytes, SeekOrigin.Begin);
                     }
 
                     for (int j = 0; j < LastIndex; j++)
@@ -733,7 +748,10 @@ namespace MoveLib.BCM
 
                         outFile.Write(file.Moves[i].Unknown17);
                         outFile.Write(file.Moves[i].Unknown18);
-                        outFile.Write(file.Moves[i].Unknown19); // TODO: Why is this omitted?
+                        // The writer emits a BCM v1 header (version 1 at bytes 0xA-0xB).
+                        // Unknown19 only exists in the BCM v0 move record; the reader
+                        // correctly omits it for v1. Writing it here inserted four bytes
+                        // into every move and shifted Unknown20..Unknown28 on re-read.
                         outFile.Write(file.Moves[i].Unknown20);
                         outFile.Write(file.Moves[i].Unknown21);
                         outFile.Write(file.Moves[i].Unknown22);

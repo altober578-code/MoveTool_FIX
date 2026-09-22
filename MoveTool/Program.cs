@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
 using MoveLib;
@@ -21,6 +22,8 @@ namespace MoveTool
 
         private static void Start(string[] args)
         {
+            BAC.StaleTypeCountDecision = AskAboutStaleTypeCounts;
+
             switch (args.Length)
             {
                 case 0:
@@ -122,37 +125,7 @@ namespace MoveTool
 
                     if (args[0].ToLower().EndsWith("json"))
                     {
-                        Console.WriteLine("File is json.");
-
-                        var success = BAC.JsonToBac(
-                            args[0],
-                            Path.GetDirectoryName(args[0]) + Separator +
-                            Path.GetFileNameWithoutExtension(args[0]) + ".uasset");
-
-                        if (!success)
-                        {
-                            success = BCM.JsonToBcm(args[0],
-                                Path.GetDirectoryName(args[0]) + Separator +
-                                Path.GetFileNameWithoutExtension(args[0]) + ".uasset");
-                        }
-
-                        if (!success)
-                        {
-                            success = BCH.JsonToBch(args[0],
-                                Path.GetDirectoryName(args[0]) + Separator +
-                                Path.GetFileNameWithoutExtension(args[0]) + ".uasset");
-                        }
-
-                        if (!success)
-                        {
-                            Console.WriteLine("Something went wrong while parsing json.");
-                        }
-                        else
-                        {
-                            Console.WriteLine("Done writing file: " + Path.GetDirectoryName(args[0]) +
-                                              Separator + Path.GetFileNameWithoutExtension(args[0]) +
-                                              ".uasset");
-                        }
+                        ConvertJsonToUasset(args[0], directory + fileNameWithoutExtension + ".uasset");
                     }
 
                     #endregion
@@ -207,24 +180,7 @@ namespace MoveTool
                             outFile += ".uasset";
                         }
 
-                        Console.WriteLine("File is json.");
-
-                        var success = BAC.JsonToBac(inFile, outFile);
-
-                        if (!success)
-                        {
-                            success = BCM.JsonToBcm(inFile, outFile);
-                        }
-
-                        if (!success)
-                        {
-                            success = BCH.JsonToBch(inFile, outFile);
-                        }
-
-                        if (!success)
-                            Console.WriteLine("Something went wrong while parsing json.");
-                        else
-                            Console.WriteLine("Done writing file: " + outFile);
+                        ConvertJsonToUasset(inFile, outFile);
                     }
 
                     break;
@@ -241,8 +197,120 @@ namespace MoveTool
             Pause();
         }
 
+        /// <summary>
+        /// Asked once per BAC write when moves declare more type blocks than the json holds.
+        /// A stale count is usually left over from an older tool, but correcting it does
+        /// change the file, so the choice is the user's. Only BAC headers work this way;
+        /// a BCM's short CancelInts lists are always preserved, as the missing pairs cannot
+        /// be recovered.
+        /// </summary>
+        private static bool AskAboutStaleTypeCounts(IList<string> moves)
+        {
+            const int ShowAtMost = 10;
+
+            Console.WriteLine();
+            Console.WriteLine(moves.Count + " move(s) declare more type blocks than this file holds:");
+
+            for (int i = 0; i < moves.Count && i < ShowAtMost; i++)
+            {
+                Console.WriteLine("  " + moves[i]);
+            }
+
+            if (moves.Count > ShowAtMost)
+            {
+                Console.WriteLine("  ... and " + (moves.Count - ShowAtMost) + " more.");
+            }
+
+            Console.WriteLine("The surplus entries overlap the tick data that follows the type list,");
+            Console.WriteLine("so they are not extra moves data. Correcting makes each header match the");
+            Console.WriteLine("blocks actually written; leaving them keeps the file exactly as found.");
+            Console.Write("Correct these headers? (y = correct, any other key = leave as is): ");
+
+            bool correct;
+
+            if (Console.IsInputRedirected)
+            {
+                // Scripted runs: honour a piped answer, and default to leaving the file
+                // alone when there is nothing to read.
+                string answer = Console.In.ReadLine();
+                correct = answer != null && answer.Trim().StartsWith("y", StringComparison.OrdinalIgnoreCase);
+                Console.WriteLine(answer == null ? "(no answer given)" : answer.Trim());
+            }
+            else
+            {
+                ConsoleKeyInfo key = Console.ReadKey(true);
+                correct = key.KeyChar == 'y' || key.KeyChar == 'Y';
+                Console.WriteLine(key.KeyChar);
+            }
+
+            Console.WriteLine(correct
+                ? "Correcting the headers."
+                : "Leaving the headers as they are.");
+            Console.WriteLine();
+
+            return correct;
+        }
+
+        /// <summary>
+        /// Converts a json back to its uasset, choosing the converter up front from the
+        /// json's own contents. Trying each converter in turn used to report the failure
+        /// of the wrong ones as an error, which read like the conversion had failed even
+        /// when the right converter went on to succeed.
+        /// </summary>
+        private static void ConvertJsonToUasset(string inFile, string outFile)
+        {
+            Console.WriteLine("File is json. Reading it to work out which format it holds.");
+
+            var type = FileTypeDecider.DecideJson(inFile);
+            bool success;
+
+            switch (type)
+            {
+                case FileType.BAC:
+                    Console.WriteLine("Detected a BAC json. Converting it to a BAC uasset.");
+                    success = BAC.JsonToBac(inFile, outFile);
+                    break;
+
+                case FileType.BCM:
+                    Console.WriteLine("Detected a BCM json. Converting it to a BCM uasset.");
+                    success = BCM.JsonToBcm(inFile, outFile);
+                    break;
+
+                case FileType.BCH:
+                    Console.WriteLine("Detected a BCH json. Converting it to a BCH uasset.");
+                    success = BCH.JsonToBch(inFile, outFile);
+                    break;
+
+                default:
+                    Console.WriteLine(
+                        "Could not tell which format this json holds, so nothing was converted." +
+                        "\nA BAC json starts with \"MoveLists\", a BCM json with \"Charges\", " +
+                        "a BCH json with \"BCH\"." +
+                        "\nIf the file is one of those, it is most likely truncated or not valid json.");
+                    return;
+            }
+
+            if (success)
+            {
+                Console.WriteLine("Success. Wrote " + type + " uasset: " + outFile);
+            }
+            else
+            {
+                Console.WriteLine("Conversion to " + type + " failed, so " + outFile +
+                                  " was not written. The reason is printed above.");
+            }
+        }
+
         private static void Pause()
         {
+            // ReadKey throws InvalidOperationException when MoveTool is run from
+            // a script with redirected stdin/stdout. Interactive drag-and-drop
+            // runs should still pause so the user can read the result.
+            if (Console.IsInputRedirected)
+            {
+                return;
+            }
+
             Console.Write("\n\nPress any key to continue...");
             Console.ReadKey(true);
             Console.WriteLine("\n");
